@@ -28,7 +28,7 @@ type Direction int
 const (
 	DirectionInbound Direction = iota
 	DirectionOutbound
-	DirectionBi
+	DirectionBoth
 )
 
 type Protocol int
@@ -42,18 +42,18 @@ const (
 func (p Protocol) getLayers(d Direction) []wf.LayerID {
 	var layers []wf.LayerID
 	if p == ProtocolAll || p == ProtocolV4 {
-		if d == DirectionBi || d == DirectionInbound {
+		if d == DirectionBoth || d == DirectionInbound {
 			layers = append(layers, wf.LayerALEAuthRecvAcceptV4)
 		}
-		if d == DirectionBi || d == DirectionOutbound {
+		if d == DirectionBoth || d == DirectionOutbound {
 			layers = append(layers, wf.LayerALEAuthConnectV4)
 		}
 	}
 	if p == ProtocolAll || p == ProtocolV6 {
-		if d == DirectionBi || d == DirectionInbound {
+		if d == DirectionBoth || d == DirectionInbound {
 			layers = append(layers, wf.LayerALEAuthRecvAcceptV6)
 		}
-		if d == DirectionBi || d == DirectionOutbound {
+		if d == DirectionBoth || d == DirectionOutbound {
 			layers = append(layers, wf.LayerALEAuthConnectV6)
 		}
 	}
@@ -123,44 +123,53 @@ func New(luid uint64) (*Firewall, error) {
 	}, nil
 }
 
+type weight uint64
+
+const (
+	weightTailscaleTraffic weight = 15
+	weightKnownTraffic     weight = 12
+	weightCatchAll         weight = 0
+)
+
 func (f *Firewall) Enable() error {
-	if err := f.permitTailscaleService(15); err != nil {
+	if err := f.permitTailscaleService(weightTailscaleTraffic); err != nil {
 		return fmt.Errorf("permitTailscaleService failed: %w", err)
 	}
 
-	if err := f.permitDNS(15); err != nil {
-		return fmt.Errorf("permitDNS failed: %w", err)
-	}
-
-	if err := f.permitLoopback(13); err != nil {
-		return fmt.Errorf("permitLoopback failed: %w", err)
-	}
-
-	if err := f.permitTunInterface(12); err != nil {
+	if err := f.permitTunInterface(weightTailscaleTraffic); err != nil {
 		return fmt.Errorf("permitTunInterface failed: %w", err)
 	}
 
-	if err := f.permitDHCPv4(12); err != nil {
+	if err := f.permitDNS(weightTailscaleTraffic); err != nil {
+		return fmt.Errorf("permitDNS failed: %w", err)
+	}
+
+	if err := f.permitLoopback(weightKnownTraffic); err != nil {
+		return fmt.Errorf("permitLoopback failed: %w", err)
+	}
+
+	if err := f.permitDHCPv4(weightKnownTraffic); err != nil {
 		return fmt.Errorf("permitDHCPv4 failed: %w", err)
 	}
 
-	if err := f.permitDHCPv6(12); err != nil {
+	if err := f.permitDHCPv6(weightKnownTraffic); err != nil {
 		return fmt.Errorf("permitDHCPv6 failed: %w", err)
 	}
 
-	if err := f.permitNDP(12); err != nil {
+	if err := f.permitNDP(weightKnownTraffic); err != nil {
 		return fmt.Errorf("permitNDP failed: %w", err)
 	}
 
 	/* TODO: actually evaluate if this does anything and if we need this. It's layer 2; our other rules are layer 3.
 	 *  In other words, if somebody complains, try enabling it. For now, keep it off.
-	err = permitHyperV(session, baseObjects, 12)
+	 * TODO(maisem): implement this.
+	err = permitHyperV(session, baseObjects, weightKnownTraffic)
 	if err != nil {
 		return wrapErr(err)
 	}
 	*/
 
-	if err := f.blockAll(0); err != nil {
+	if err := f.blockAll(weightCatchAll); err != nil {
 		return fmt.Errorf("blockAll failed: %w", err)
 	}
 	return nil
@@ -205,7 +214,7 @@ func (f *Firewall) UpdatePermittedRoutes(newRoutes []netaddr.IPPrefix) error {
 		} else {
 			p = ProtocolV6
 		}
-		rules, err := f.addRules("local route", 15, conditions, wf.ActionPermit, p, DirectionBi)
+		rules, err := f.addRules("local route", weightKnownTraffic, conditions, wf.ActionPermit, p, DirectionBoth)
 		if err != nil {
 			return err
 		}
@@ -214,7 +223,7 @@ func (f *Firewall) UpdatePermittedRoutes(newRoutes []netaddr.IPPrefix) error {
 	return nil
 }
 
-func (f *Firewall) newRule(name string, weight uint64, layer wf.LayerID, conditions []*wf.Match, action wf.Action) (*wf.Rule, error) {
+func (f *Firewall) newRule(name string, w weight, layer wf.LayerID, conditions []*wf.Match, action wf.Action) (*wf.Rule, error) {
 	id, err := windows.GenerateGUID()
 	if err != nil {
 		return nil, err
@@ -226,16 +235,16 @@ func (f *Firewall) newRule(name string, weight uint64, layer wf.LayerID, conditi
 		Sublayer:   f.sublayerID,
 		HardAction: false,
 		Layer:      layer,
-		Weight:     weight,
+		Weight:     uint64(w),
 		Conditions: conditions,
 		Action:     action,
 	}, nil
 }
 
-func (f *Firewall) addRules(name string, weight uint64, conditions []*wf.Match, action wf.Action, p Protocol, d Direction) ([]*wf.Rule, error) {
+func (f *Firewall) addRules(name string, w weight, conditions []*wf.Match, action wf.Action, p Protocol, d Direction) ([]*wf.Rule, error) {
 	var rules []*wf.Rule
 	for _, l := range p.getLayers(d) {
-		r, err := f.newRule(name, weight, l, conditions, action)
+		r, err := f.newRule(name, w, l, conditions, action)
 		if err != nil {
 			return nil, err
 		}
@@ -247,12 +256,14 @@ func (f *Firewall) addRules(name string, weight uint64, conditions []*wf.Match, 
 	return rules, nil
 }
 
-func (f *Firewall) blockAll(weight uint64) error {
-	_, err := f.addRules("all", weight, nil, wf.ActionBlock, ProtocolAll, DirectionBi)
+func (f *Firewall) blockAll(w weight) error {
+	_, err := f.addRules("all", w, nil, wf.ActionBlock, ProtocolAll, DirectionBoth)
 	return err
 }
 
-func (f *Firewall) permitNDP(weight uint64) error {
+func (f *Firewall) permitNDP(w weight) error {
+	// These are aliased according to:
+	// https://social.msdn.microsoft.com/Forums/azure/en-US/eb2aa3cd-5f1c-4461-af86-61e7d43ccc23/filtering-icmp-by-type-code?forum=wfp
 	fieldICMPType := wf.FieldIPLocalPort
 	fieldICMPCode := wf.FieldIPRemotePort
 
@@ -296,7 +307,7 @@ func (f *Firewall) permitNDP(weight uint64) error {
 	// ICMP type 133, code 0. Outgoing.
 	//
 	conditions := icmpConditions(133, 0, linkLocalRouterMulticast)
-	if _, err := f.addRules("NDP type 133", weight, conditions, wf.ActionPermit, ProtocolV6, DirectionOutbound); err != nil {
+	if _, err := f.addRules("NDP type 133", w, conditions, wf.ActionPermit, ProtocolV6, DirectionOutbound); err != nil {
 		return err
 	}
 
@@ -305,7 +316,7 @@ func (f *Firewall) permitNDP(weight uint64) error {
 	// ICMP type 134, code 0. Incoming.
 	//
 	conditions = icmpConditions(134, 0, linkLocalRange)
-	if _, err := f.addRules("NDP type 134", weight, conditions, wf.ActionPermit, ProtocolV6, DirectionInbound); err != nil {
+	if _, err := f.addRules("NDP type 134", w, conditions, wf.ActionPermit, ProtocolV6, DirectionInbound); err != nil {
 		return err
 	}
 
@@ -314,7 +325,7 @@ func (f *Firewall) permitNDP(weight uint64) error {
 	// ICMP type 135, code 0. Bi-directional.
 	//
 	conditions = icmpConditions(135, 0, nil)
-	if _, err := f.addRules("NDP type 135", weight, conditions, wf.ActionPermit, ProtocolV6, DirectionBi); err != nil {
+	if _, err := f.addRules("NDP type 135", w, conditions, wf.ActionPermit, ProtocolV6, DirectionBoth); err != nil {
 		return err
 	}
 
@@ -323,7 +334,7 @@ func (f *Firewall) permitNDP(weight uint64) error {
 	// ICMP type 136, code 0. Bi-directional.
 	//
 	conditions = icmpConditions(136, 0, nil)
-	if _, err := f.addRules("NDP type 136", weight, conditions, wf.ActionPermit, ProtocolV6, DirectionBi); err != nil {
+	if _, err := f.addRules("NDP type 136", w, conditions, wf.ActionPermit, ProtocolV6, DirectionBoth); err != nil {
 		return err
 	}
 
@@ -332,13 +343,13 @@ func (f *Firewall) permitNDP(weight uint64) error {
 	// ICMP type 137, code 0. Incoming.
 	//
 	conditions = icmpConditions(137, 0, linkLocalRange)
-	if _, err := f.addRules("NDP type 137", weight, conditions, wf.ActionPermit, ProtocolV6, DirectionInbound); err != nil {
+	if _, err := f.addRules("NDP type 137", w, conditions, wf.ActionPermit, ProtocolV6, DirectionInbound); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (f *Firewall) permitDHCPv6(weight uint64) error {
+func (f *Firewall) permitDHCPv6(w weight) error {
 	var dhcpConditions = func(remoteAddrs ...interface{}) []*wf.Match {
 		conditions := []*wf.Match{
 			{
@@ -372,17 +383,17 @@ func (f *Firewall) permitDHCPv6(weight uint64) error {
 		return conditions
 	}
 	conditions := dhcpConditions(linkLocalDHCPMulticast, siteLocalDHCPMulticast)
-	if _, err := f.addRules("DHCP request", weight, conditions, wf.ActionPermit, ProtocolV6, DirectionOutbound); err != nil {
+	if _, err := f.addRules("DHCP request", w, conditions, wf.ActionPermit, ProtocolV6, DirectionOutbound); err != nil {
 		return err
 	}
 	conditions = dhcpConditions(linkLocalRange)
-	if _, err := f.addRules("DHCP response", weight, conditions, wf.ActionPermit, ProtocolV6, DirectionInbound); err != nil {
+	if _, err := f.addRules("DHCP response", w, conditions, wf.ActionPermit, ProtocolV6, DirectionInbound); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (f *Firewall) permitDHCPv4(weight uint64) error {
+func (f *Firewall) permitDHCPv4(w weight) error {
 	var dhcpConditions = func(remoteAddrs ...interface{}) []*wf.Match {
 		conditions := []*wf.Match{
 			{
@@ -411,18 +422,18 @@ func (f *Firewall) permitDHCPv4(weight uint64) error {
 		return conditions
 	}
 	conditions := dhcpConditions(netaddr.IPv4(255, 255, 255, 255))
-	if _, err := f.addRules("DHCP request", weight, conditions, wf.ActionPermit, ProtocolV4, DirectionOutbound); err != nil {
+	if _, err := f.addRules("DHCP request", w, conditions, wf.ActionPermit, ProtocolV4, DirectionOutbound); err != nil {
 		return err
 	}
 
 	conditions = dhcpConditions()
-	if _, err := f.addRules("DHCP response", weight, conditions, wf.ActionPermit, ProtocolV4, DirectionInbound); err != nil {
+	if _, err := f.addRules("DHCP response", w, conditions, wf.ActionPermit, ProtocolV4, DirectionInbound); err != nil {
 		return err
 	}
 	return nil
 }
 
-func (f *Firewall) permitTunInterface(weight uint64) error {
+func (f *Firewall) permitTunInterface(w weight) error {
 	condition := []*wf.Match{
 		{
 			Field: wf.FieldIPLocalInterface,
@@ -430,11 +441,11 @@ func (f *Firewall) permitTunInterface(weight uint64) error {
 			Value: f.luid,
 		},
 	}
-	_, err := f.addRules("on TUN", weight, condition, wf.ActionPermit, ProtocolAll, DirectionBi)
+	_, err := f.addRules("on TUN", w, condition, wf.ActionPermit, ProtocolAll, DirectionBoth)
 	return err
 }
 
-func (f *Firewall) permitLoopback(weight uint64) error {
+func (f *Firewall) permitLoopback(w weight) error {
 	condition := []*wf.Match{
 		{
 			Field: wf.FieldFlags,
@@ -442,11 +453,11 @@ func (f *Firewall) permitLoopback(weight uint64) error {
 			Value: wf.ConditionFlagIsLoopback,
 		},
 	}
-	_, err := f.addRules("on loopback", weight, condition, wf.ActionPermit, ProtocolAll, DirectionBi)
+	_, err := f.addRules("on loopback", w, condition, wf.ActionPermit, ProtocolAll, DirectionBoth)
 	return err
 }
 
-func (f *Firewall) permitDNS(weight uint64) error {
+func (f *Firewall) permitDNS(w weight) error {
 	conditions := []*wf.Match{
 		{
 			Field: wf.FieldIPRemotePort,
@@ -465,11 +476,11 @@ func (f *Firewall) permitDNS(weight uint64) error {
 			Value: wf.IPProtoTCP,
 		},
 	}
-	_, err := f.addRules("DNS", weight, conditions, wf.ActionPermit, ProtocolAll, DirectionBi)
+	_, err := f.addRules("DNS", w, conditions, wf.ActionPermit, ProtocolAll, DirectionBoth)
 	return err
 }
 
-func (f *Firewall) permitTailscaleService(weight uint64) error {
+func (f *Firewall) permitTailscaleService(w weight) error {
 	currentFile, err := os.Executable()
 	if err != nil {
 		return err
@@ -486,6 +497,6 @@ func (f *Firewall) permitTailscaleService(weight uint64) error {
 			Value: appID,
 		},
 	}
-	_, err = f.addRules("unrestricted traffic for Tailscale service", weight, conditions, wf.ActionPermit, ProtocolAll, DirectionBi)
+	_, err = f.addRules("unrestricted traffic for Tailscale service", w, conditions, wf.ActionPermit, ProtocolAll, DirectionBoth)
 	return err
 }
